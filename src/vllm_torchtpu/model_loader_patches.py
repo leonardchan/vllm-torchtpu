@@ -50,7 +50,6 @@ in the allowlist and stay unfiltered.
 
 import copy
 import functools
-import gc
 import json
 import os
 import struct
@@ -65,6 +64,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.host_memory import trim_host_heap
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -386,12 +386,19 @@ def _sharded_runai_weights_iterator(
 
         def _device_sync() -> None:
             try:
+                try:
+                    from torch_tpu._internal import sync as _tpu_sync
+
+                    _tpu_sync.synchronize(wait=True)
+                except ImportError:
+                    pass
                 torch.accelerator.synchronize()
             except Exception:
                 logger.warning_once(
                     "[sharded-ep-load] torch.accelerator.synchronize() unavailable "
                     "during load; host memory may accumulate."
                 )
+            trim_host_heap()
 
         progress = tqdm(
             total=kept,
@@ -683,7 +690,7 @@ def _evict_checkpoint_page_cache(files: list[str]) -> None:
         sizes = list(executor.map(_evict_one_checkpoint_file, files))
     evicted_count = sum(s is not None for s in sizes)
     evicted_gb = sum(s for s in sizes if s is not None)
-    gc.collect()
+    trim_host_heap()
     logger.info(
         "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
         evicted_count,
@@ -895,6 +902,7 @@ class ExpertParamStager:
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
             self.flush(param)
+        self._pool.clear()
 
     def __len__(self) -> int:
         return len(self._staged)

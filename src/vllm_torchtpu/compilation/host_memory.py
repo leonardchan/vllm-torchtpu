@@ -35,6 +35,7 @@ def _glibc_allocator() -> ctypes.CDLL:
         trim = libc.malloc_trim
         version = libc.gnu_get_libc_version
         dladdr = libc.dladdr
+        dlsym = libc.dlsym
     except AttributeError as error:
         raise RuntimeError(message) from error
     version.restype = ctypes.c_char_p
@@ -42,18 +43,47 @@ def _glibc_allocator() -> ctypes.CDLL:
     trim.restype = ctypes.c_int
     dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(_DlInfo)]
     dladdr.restype = ctypes.c_int
+    dlsym.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    dlsym.restype = ctypes.c_void_p
     allocator_info, trim_info, version_info = _DlInfo(), _DlInfo(), _DlInfo()
     if (
         not dladdr(ctypes.cast(malloc, ctypes.c_void_p), ctypes.byref(allocator_info))
         or not dladdr(ctypes.cast(trim, ctypes.c_void_p), ctypes.byref(trim_info))
         or not dladdr(ctypes.cast(version, ctypes.c_void_p), ctypes.byref(version_info))
-        or not allocator_info.dli_fbase
+    ):
+        raise RuntimeError(message)
+    if allocator_info.dli_fbase != trim_info.dli_fbase:
+        # On non-PIE Python binaries, RTLD_DEFAULT resolves `malloc` to the
+        # executable's PLT trampoline; RTLD_NEXT (-1) resolves the shared-object
+        # provider (or an LD_PRELOADed allocator if one is interposed).
+        next_malloc = dlsym(ctypes.c_void_p(-1), b"malloc")
+        if not next_malloc or not dladdr(
+            ctypes.c_void_p(next_malloc), ctypes.byref(allocator_info)
+        ):
+            raise RuntimeError(message)
+    if (
+        not allocator_info.dli_fbase
         or allocator_info.dli_fbase != trim_info.dli_fbase
         or allocator_info.dli_fbase != version_info.dli_fbase
         or not version()
     ):
         raise RuntimeError(message)
     return libc
+
+
+def trim_host_heap() -> bool:
+    """Collect dead Python cycles and return idle glibc heap pages to the OS.
+
+    Returns True when glibc ``malloc_trim(0)`` ran, or False when another host
+    allocator is active or the platform is not Linux with glibc.
+    """
+    gc.collect()
+    try:
+        allocator = _glibc_allocator()
+    except RuntimeError:
+        return False
+    allocator.malloc_trim(0)
+    return True
 
 
 def reclaim_after_compile(
