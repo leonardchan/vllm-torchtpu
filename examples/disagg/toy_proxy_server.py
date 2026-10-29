@@ -170,10 +170,89 @@ async def _post_with_retries(
             raise
 
 
-def _render_endpoint_for_api(api: str) -> str | None:
-    if api == "/v1/completions":
-        return "/v1/completions/render"
-    return None
+def _is_token_id_prompt(prompt: Any) -> bool:
+    """Return True when ``prompt`` is already token IDs (int or list of int lists)."""
+    if not isinstance(prompt, list) or not prompt:
+        return False
+    if all(type(token_id) is int and token_id >= 0 for token_id in prompt):
+        return True
+    return all(
+        isinstance(item, list)
+        and bool(item)
+        and all(type(token_id) is int and token_id >= 0 for token_id in item)
+        for item in prompt
+    )
+
+
+def _is_raw_text_prompt(prompt: Any) -> bool:
+    """Return True when ``prompt`` is raw text (str or non-empty list[str])."""
+    if isinstance(prompt, str):
+        return True
+    return (
+        isinstance(prompt, list)
+        and bool(prompt)
+        and all(isinstance(item, str) for item in prompt)
+    )
+
+
+def _render_completions_enabled() -> bool:
+    """Return True when completion rendering is enabled via CLI or env (default 1).
+
+    Checks ``global_args.render_completions`` (set by ``--render-completions`` /
+    ``--no-render-completions``) first, then falls back to
+    ``PROXY_RENDER_COMPLETIONS`` (default ``"1"``).
+    """
+    cli_pref = getattr(globals().get("global_args"), "render_completions", None)
+    if cli_pref is not None:
+        return bool(cli_pref)
+    env_val = os.getenv("PROXY_RENDER_COMPLETIONS", "1").strip().lower()
+    return env_val not in ("0", "false", "no", "off")
+
+
+def _render_endpoint_for_api(
+    api: str, req_data: dict[str, Any] | None = None
+) -> str | None:
+    if api != "/v1/completions":
+        return None
+    if not _render_completions_enabled():
+        return None
+    if isinstance(req_data, dict) and _is_token_id_prompt(req_data.get("prompt")):
+        return None
+    return "/v1/completions/render"
+
+
+def _forward_prompt_token_ids_if_present(
+    api: str, req_data: dict[str, Any], prefill_json: Any
+) -> None:
+    """Replace raw text prompt with prefill's ``prompt_token_ids`` when present."""
+    if (
+        api not in ("/v1/completions", "/completions")
+        or not _is_raw_text_prompt(req_data.get("prompt"))
+        or not isinstance(prefill_json, dict)
+    ):
+        return
+    prompt_token_ids = prefill_json.get("prompt_token_ids")
+    if not prompt_token_ids:
+        choices = prefill_json.get("choices")
+        if isinstance(choices, list) and choices:
+            if isinstance(req_data.get("prompt"), list) and len(choices) > 1:
+                multi = [
+                    c.get("prompt_token_ids")
+                    for c in choices
+                    if isinstance(c, dict)
+                    and _is_token_id_prompt(c.get("prompt_token_ids"))
+                ]
+                if len(multi) == len(choices):
+                    prompt_token_ids = multi
+            elif isinstance(choices[0], dict):
+                prompt_token_ids = choices[0].get("prompt_token_ids")
+    if not prompt_token_ids:
+        kv_params = prefill_json.get("kv_transfer_params")
+        if isinstance(kv_params, dict):
+            prompt_token_ids = kv_params.get("prompt_token_ids")
+    if _is_token_id_prompt(prompt_token_ids):
+        req_data["prompt"] = prompt_token_ids
+        req_data.pop("prompt_embeds", None)
 
 
 def _token_ids_from_completion_render(rendered: Any) -> list[int] | list[list[int]]:
@@ -234,6 +313,121 @@ class _AsciiSafeStreamEncoder:
         return _json_escape_non_ascii(text)
 
 
+_MAX_PREFIX_CACHE_ENTRIES = 4096
+
+
+def _extract_prefix_hash(req_data: dict[str, Any] | None) -> int | None:
+    """Compute a lightweight hash of the request prefix for DP cache affinity."""
+    if not isinstance(req_data, dict):
+        return None
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, list) and prompt:
+        if type(prompt[0]) is int:
+            return hash(tuple(prompt[:256]))
+        if isinstance(prompt[0], list) and prompt[0] and type(prompt[0][0]) is int:
+            return hash(tuple(prompt[0][:256]))
+        if isinstance(prompt[0], str) and prompt[0]:
+            return hash(prompt[0][:1024])
+    elif isinstance(prompt, str) and prompt:
+        return hash(prompt[:1024])
+
+    messages = req_data.get("messages")
+    if isinstance(messages, list) and messages:
+        parts: list[str] = []
+        total_chars = 0
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str) and content:
+                    take = content[: 1024 - total_chars]
+                    parts.append(take)
+                    total_chars += len(take)
+                    if total_chars >= 1024:
+                        break
+        if parts:
+            return hash("".join(parts))
+    return None
+
+
+def _acquire_dp_rank(
+    client_info: dict[str, Any],
+    requested_dp_rank: str | None = None,
+    prefix_hash: int | None = None,
+) -> tuple[dict[str, str], int | None]:
+    """Select a DP rank using prefix affinity + least-inflight with spillover.
+
+    When ``requested_dp_rank`` is explicitly provided by the caller, preserve
+    it and track its inflight count when it maps to a valid rank index. When
+    ``dp_size <= 1`` and no rank was requested, return ``({}, None)``.
+    When ``prefix_hash`` is provided, prefer cached DP ranks whose inflight load
+    is below ``(sum(inflight) // dp_size) + 1``, spilling over to least-inflight
+    with round-robin tie-breaking across all ranks as concurrency grows.
+    """
+    dp_size = max(1, int(client_info.get("dp_size", 1) or 1))
+    inflight = client_info.get("dp_inflight")
+    if not isinstance(inflight, list) or len(inflight) < dp_size:
+        inflight = [0] * dp_size
+        client_info["dp_inflight"] = inflight
+
+    if requested_dp_rank is not None:
+        forwarded = {"X-data-parallel-rank": requested_dp_rank}
+        try:
+            rank_idx = int(requested_dp_rank)
+        except ValueError:
+            return forwarded, None
+        if 0 <= rank_idx < len(inflight):
+            inflight[rank_idx] += 1
+            return forwarded, rank_idx
+        return forwarded, None
+
+    if dp_size <= 1:
+        return {}, None
+
+    cursor = int(client_info.get("dp_cursor", 0) or 0) % dp_size
+    all_candidates = [(cursor + offset) % dp_size for offset in range(dp_size)]
+    candidates = all_candidates
+    cached_map: dict[int, set[int]] | None = None
+    if prefix_hash is not None:
+        raw_map = client_info.get("dp_cached_ranks")
+        if not isinstance(raw_map, dict):
+            raw_map = {}
+            client_info["dp_cached_ranks"] = raw_map
+        cached_map = raw_map
+        cached = cached_map.get(prefix_hash)
+        if cached:
+            max_load = (sum(inflight) // dp_size) + 1
+            aff_candidates = [
+                r for r in all_candidates if r in cached and inflight[r] < max_load
+            ]
+            if aff_candidates:
+                candidates = aff_candidates
+
+    best_rank = min(candidates, key=lambda r: inflight[r])
+    client_info["dp_cursor"] = (best_rank + 1) % dp_size
+    inflight[best_rank] += 1
+    if prefix_hash is not None and cached_map is not None:
+        if (
+            len(cached_map) >= _MAX_PREFIX_CACHE_ENTRIES
+            and prefix_hash not in cached_map
+        ):
+            cached_map.pop(next(iter(cached_map)), None)
+        cached_map.setdefault(prefix_hash, set()).add(best_rank)
+    return {"X-data-parallel-rank": str(best_rank)}, best_rank
+
+
+def _release_dp_rank(client_info: dict[str, Any], tracked_rank: int | None) -> None:
+    """Decrement the inflight counter for ``tracked_rank`` once a hop finishes."""
+    if tracked_rank is None:
+        return
+    inflight = client_info.get("dp_inflight")
+    if (
+        isinstance(inflight, list)
+        and 0 <= tracked_rank < len(inflight)
+        and inflight[tracked_rank] > 0
+    ):
+        inflight[tracked_rank] -= 1
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -257,6 +451,8 @@ async def lifespan(app: FastAPI):
         max_keepalive_connections=None,
         keepalive_expiry=keepalive_expiry,
     )
+    prefill_dp_size = max(1, int(getattr(global_args, "prefiller_dp_size", 1)))
+    decode_dp_size = max(1, int(getattr(global_args, "decoder_dp_size", 1)))
 
     # Create prefill clients
     for i, (host, port) in enumerate(global_args.prefiller_instances):
@@ -269,6 +465,10 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "dp_size": prefill_dp_size,
+                "dp_inflight": [0] * prefill_dp_size,
+                "dp_cursor": 0,
+                "dp_cached_ranks": {},
             }
         )
 
@@ -283,6 +483,10 @@ async def lifespan(app: FastAPI):
                 "host": host,
                 "port": port,
                 "id": i,
+                "dp_size": decode_dp_size,
+                "dp_inflight": [0] * decode_dp_size,
+                "dp_cursor": 0,
+                "dp_cached_ranks": {},
             }
         )
 
@@ -292,7 +496,8 @@ async def lifespan(app: FastAPI):
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients."
+        f"(dp_size={prefill_dp_size}) and {len(app.state.decode_clients)} "
+        f"decode clients (dp_size={decode_dp_size})."
     )
 
     yield
@@ -309,7 +514,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--port", type=int, default=8000)
@@ -334,8 +539,47 @@ def parse_args():
     parser.add_argument(
         "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[9400]
     )
+    parser.add_argument(
+        "--dp-size",
+        type=int,
+        default=None,
+        help=(
+            "Data-parallel size per backend replica; sets both "
+            "--prefiller-dp-size and --decoder-dp-size unless overridden."
+        ),
+    )
+    parser.add_argument(
+        "--prefiller-dp-size",
+        type=int,
+        default=None,
+        help=(
+            "Data-parallel size per prefill replica for least-inflight "
+            "X-data-parallel-rank routing."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-dp-size",
+        type=int,
+        default=None,
+        help=(
+            "Data-parallel size per decode replica for least-inflight "
+            "X-data-parallel-rank routing."
+        ),
+    )
+    parser.add_argument(
+        "--render-completions",
+        dest="render_completions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable or disable (--no-render-completions) the separate "
+            "/v1/completions/render RPC; when disabled, rely on 1-hop "
+            "prefill return_token_ids forwarding (default: "
+            "PROXY_RENDER_COMPLETIONS=1)."
+        ),
+    )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Validate and pair hosts with ports
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
@@ -345,6 +589,28 @@ def parse_args():
 
     if len(args.decoder_hosts) != len(args.decoder_ports):
         raise ValueError("Number of decoder hosts must match number of decoder ports")
+
+    default_dp_size = _env_int("PROXY_DP_SIZE", 1)
+    default_prefill_dp = _env_int("PROXY_PREFILLER_DP_SIZE", default_dp_size)
+    default_decode_dp = _env_int("PROXY_DECODER_DP_SIZE", default_dp_size)
+    if args.dp_size is not None:
+        if args.dp_size < 1:
+            raise ValueError("dp_size must be >= 1")
+        default_prefill_dp = args.dp_size
+        default_decode_dp = args.dp_size
+
+    args.prefiller_dp_size = (
+        args.prefiller_dp_size
+        if args.prefiller_dp_size is not None
+        else default_prefill_dp
+    )
+    args.decoder_dp_size = (
+        args.decoder_dp_size if args.decoder_dp_size is not None else default_decode_dp
+    )
+    if args.prefiller_dp_size < 1:
+        raise ValueError("prefiller_dp_size must be >= 1")
+    if args.decoder_dp_size < 1:
+        raise ValueError("decoder_dp_size must be >= 1")
 
     # Create tuples of (host, port) for each service type
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
@@ -390,8 +656,14 @@ async def send_request_to_prefill(
     req_data["max_tokens"] = 1
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
+    if "min_tokens" in req_data and req_data["min_tokens"] is not None:
+        req_data["min_tokens"] = min(int(req_data["min_tokens"]), 1)
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    if endpoint in ("/v1/completions", "/completions") and _is_raw_text_prompt(
+        req_data.get("prompt")
+    ):
+        req_data.setdefault("return_token_ids", True)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -495,11 +767,13 @@ async def _handle_completions(api: str, request: Request):
         req_data = await request.json()
         request_id = str(uuid.uuid4())
         # vLLM sends a request carrying X-data-parallel-rank to that DP rank of
-        # the engine. Passed to both hops, so that a client can hold a request
-        # to one prefill replica and one decode replica.
-        forwarded = {}
-        if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
-            forwarded["X-data-parallel-rank"] = dp_rank
+        # the engine. Passed to both hops when explicitly set by the caller, or
+        # selected per hop via prefix-aware least-inflight routing when pool
+        # dp_size > 1.
+        requested_dp_rank = request.headers.get(
+            "X-data-parallel-rank"
+        ) or request.headers.get("x-data-parallel-rank")
+        prefix_hash = _extract_prefix_hash(req_data)
         print(
             f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
             flush=True,
@@ -507,25 +781,47 @@ async def _handle_completions(api: str, request: Request):
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")
-        render_endpoint = _render_endpoint_for_api(api)
-        if render_endpoint is not None:
-            render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id, forwarded
-            )
-            req_data = _replace_prompt_with_rendered_token_ids(
-                req_data, render_response.json()
-            )
+        prefill_forwarded, prefill_tracked_rank = _acquire_dp_rank(
+            prefill_client_info, requested_dp_rank, prefix_hash=prefix_hash
+        )
+        try:
+            render_endpoint = _render_endpoint_for_api(api, req_data)
+            if render_endpoint is not None:
+                try:
+                    render_response = await render_completion_prompt(
+                        prefill_client_info,
+                        render_endpoint,
+                        req_data,
+                        request_id,
+                        prefill_forwarded,
+                    )
+                    req_data = _replace_prompt_with_rendered_token_ids(
+                        req_data, render_response.json()
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code not in (400, 404, 405, 422, 501):
+                        raise
+                    logger.warning(
+                        "Render endpoint %s returned HTTP %s for req_id=%s; "
+                        "falling back to inline return_token_ids forwarding.",
+                        render_endpoint,
+                        e.response.status_code,
+                        request_id,
+                    )
 
-        # Send request to prefill service
-        t_prefill_send = time.time()
-        t_prefill_send_perf = time.perf_counter()
-        print(
-            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
-            flush=True,
-        )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
-        )
+            # Send request to prefill service
+            t_prefill_send = time.time()
+            t_prefill_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
+                flush=True,
+            )
+            response = await send_request_to_prefill(
+                prefill_client_info, api, req_data, request_id, prefill_forwarded
+            )
+        finally:
+            _release_dp_rank(prefill_client_info, prefill_tracked_rank)
+
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -547,41 +843,48 @@ async def _handle_completions(api: str, request: Request):
 
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
+        _forward_prompt_token_ids_if_present(api, req_data, response_json)
 
         # Get the next decode client in round-robin fashion
         decode_client_info = get_next_client(request.app, "decode")
+        decode_forwarded, decode_tracked_rank = _acquire_dp_rank(
+            decode_client_info, requested_dp_rank, prefix_hash=prefix_hash
+        )
 
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
         async def generate_stream():
-            t_decode_send = time.time()
-            t_decode_send_perf = time.perf_counter()
-            print(
-                f"PERF PROXY decode_send req_id={request_id} "
-                f"ts={t_decode_send:.6f}{kv_uuid_log}",
-                flush=True,
-            )
-            first = True
-            async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id, forwarded
-            ):
-                if first:
-                    t_first = time.time()
-                    t_first_perf = time.perf_counter()
-                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                    _PROXY_LATENCY.record("ttft", ttft_ms)
-                    print(
-                        f"PERF PROXY first_chunk req_id={request_id} "
-                        f"ts={t_first:.6f} "
-                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
-                        flush=True,
-                    )
-                    first = False
-                yield chunk
+            try:
+                t_decode_send = time.time()
+                t_decode_send_perf = time.perf_counter()
+                print(
+                    f"PERF PROXY decode_send req_id={request_id} "
+                    f"ts={t_decode_send:.6f}{kv_uuid_log}",
+                    flush=True,
+                )
+                first = True
+                async for chunk in stream_from_decode(
+                    decode_client_info, api, req_data, request_id, decode_forwarded
+                ):
+                    if first:
+                        t_first = time.time()
+                        t_first_perf = time.perf_counter()
+                        decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                        ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                        _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                        _PROXY_LATENCY.record("ttft", ttft_ms)
+                        print(
+                            f"PERF PROXY first_chunk req_id={request_id} "
+                            f"ts={t_first:.6f} "
+                            f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                            f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                            flush=True,
+                        )
+                        first = False
+                    yield chunk
+            finally:
+                _release_dp_rank(decode_client_info, decode_tracked_rank)
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 
