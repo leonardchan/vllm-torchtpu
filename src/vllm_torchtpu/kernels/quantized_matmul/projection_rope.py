@@ -48,7 +48,9 @@ def is_supported(
         and w.shape == (1280, 32768)
         and scale.shape == (32768,)
         and pos.shape == (288,)
-        and cache.shape == (98816, 64)
+        and len(cache.shape) == 2
+        and cache.shape[0] > 0
+        and cache.shape[1] == 64
         and x.dtype == jnp.bfloat16
         and w.dtype == jnp.float8_e4m3fn
         and scale.dtype == jnp.float32
