@@ -46,7 +46,10 @@ def _abstract_inputs(tokens=288):
         ("scale", (1, 32768), jnp.float32),
         ("scale", (32768,), jnp.bfloat16),
         ("pos", (288,), jnp.int64),
-        ("cache", (98304, 64), jnp.float32),
+        ("cache", (0, 64), jnp.float32),
+        ("cache", (98816, 32), jnp.float32),
+        ("cache", (98816,), jnp.float32),
+        ("cache", (98816, 64), jnp.bfloat16),
     ],
 )
 def test_projection_rope_rejects_unqualified_inputs(monkeypatch, field, shape, dtype):
@@ -55,6 +58,15 @@ def test_projection_rope_rejects_unqualified_inputs(monkeypatch, field, shape, d
     if field is not None:
         inputs[field] = jax.ShapeDtypeStruct(shape, dtype)
     assert kernel.is_supported(**inputs) is (field is None)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("cache_rows", [16384, 20480, 98304, 98816])
+def test_projection_rope_accepts_truncated_rope_cache_rows(monkeypatch, cache_rows):
+    monkeypatch.setattr(kernel, "get_tpu_version", lambda: 7)
+    inputs = _abstract_inputs()
+    inputs["cache"] = jax.ShapeDtypeStruct((cache_rows, 64), jnp.float32)
+    assert kernel.is_supported(**inputs)
 
 
 @pytest.mark.cpu_test
