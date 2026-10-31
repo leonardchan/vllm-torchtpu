@@ -573,3 +573,65 @@ def test_model_filter_preserves_original_checkpoint_names():
     assert [call.args[0] for call in keep.call_args_list] == [skipped_name, kept_name]
     requests = streamer.stream_files.call_args.args[0]
     assert [(request.offsets, request.sizes) for request in requests] == [([108], [4])]
+
+
+@pytest.mark.cpu_test
+def test_sharded_stream_sync_trims_host_heap(monkeypatch):
+    """Periodic and final _device_sync() calls trim freed glibc host arenas."""
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    file_meta = _fake_file_meta(100, [("a.weight", 4), ("b.weight", 4)])
+    tensor = MagicMock()
+    tensor.clone.return_value = tensor
+    streamer = MagicMock()
+    streamer.__enter__.return_value = streamer
+    streamer.file_streamer = streamer
+    streamer.get_chunks.return_value = iter(
+        [(0, 0, memoryview(b"aaaa")), (0, 1, memoryview(b"bbbb"))]
+    )
+    trimmed: list[bool] = []
+    monkeypatch.setattr(envs, "TPU_SHARDED_LOAD_SYNC_EVERY", 2, raising=False)
+    monkeypatch.setattr(mlp, "trim_host_heap", lambda: trimmed.append(True) or True)
+
+    with (
+        patch.object(
+            safetensors_streamer, "SafetensorsStreamer", return_value=streamer
+        ),
+        patch.object(sp.SafetensorsMetadata, "from_files", return_value=[file_meta]),
+        patch.object(sp, "create_torch_tensor", return_value=tensor),
+    ):
+        list(
+            _sharded_runai_weights_iterator(
+                ["weights.safetensors"],
+                local_expert_ids=set(),
+                use_tqdm_on_load=False,
+            )
+        )
+
+    # Once at yielded == 2 (periodic sync_every=2) and once after streaming ends.
+    assert len(trimmed) == 2
+
+
+@pytest.mark.cpu_test
+def test_expert_param_stager_flush_all_clears_staging_pool():
+    """flush_all() releases pooled staging buffers so trim_host_heap reclaims them."""
+    import torch
+
+    from vllm_torchtpu.model_loader_patches import ExpertParamStager
+
+    stager = ExpertParamStager()
+    param = torch.nn.Parameter(
+        torch.zeros((4, 8), dtype=torch.float32), requires_grad=False
+    )
+    host = stager.host_param(param)
+    host[0].fill_(1.0)
+    stager.flush(param)
+    assert len(stager._pool) == 1
+    stager.flush_all()
+    assert stager.flushed == 1
+    assert stager._pool == {}

@@ -72,3 +72,49 @@ def test_disabled_leaves_files_untouched(evicted, monkeypatch):
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
     mlp.evict_loaded_weights_page_cache()
     assert evicted == []
+
+
+@pytest.mark.cpu_test
+def test_evict_checkpoint_page_cache_trims_host_heap(tmp_path, monkeypatch):
+    """Page cache eviction also trims idle glibc arenas back to the OS."""
+    shard = tmp_path / "shard-0.safetensors"
+    shard.write_bytes(b"x" * 16)
+    trimmed: list[bool] = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, offset, length, advice: None)
+    monkeypatch.setattr(mlp, "trim_host_heap", lambda: trimmed.append(True) or True)
+
+    mlp._evict_checkpoint_page_cache([str(shard)])
+    assert trimmed == [True]
+
+
+@pytest.mark.cpu_test
+def test_trim_host_heap_invokes_glibc_malloc_trim_and_tolerates_non_glibc(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.compilation import host_memory
+
+    trim_args: list[int] = []
+    fake_libc = SimpleNamespace(malloc_trim=lambda pad: trim_args.append(pad) or 1)
+    monkeypatch.setattr(host_memory, "_glibc_allocator", lambda: fake_libc)
+    assert host_memory.trim_host_heap() is True
+    assert trim_args == [0]
+
+    def raise_non_glibc():
+        raise RuntimeError("non-glibc allocator")
+
+    monkeypatch.setattr(host_memory, "_glibc_allocator", raise_non_glibc)
+    assert host_memory.trim_host_heap() is False
+
+
+@pytest.mark.cpu_test
+def test_real_glibc_allocator_resolves_across_plt_trampoline():
+    import sys
+
+    from vllm_torchtpu.compilation import host_memory
+
+    if sys.platform != "linux":
+        pytest.skip("Linux glibc test only")
+    host_memory._glibc_allocator.cache_clear()
+    libc = host_memory._glibc_allocator()
+    assert libc.gnu_get_libc_version()
+    assert host_memory.trim_host_heap() is True

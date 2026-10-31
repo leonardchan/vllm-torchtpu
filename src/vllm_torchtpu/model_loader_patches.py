@@ -50,7 +50,6 @@ in the allowlist and stay unfiltered.
 
 import copy
 import functools
-import gc
 import json
 import os
 import struct
@@ -65,6 +64,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.host_memory import trim_host_heap
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -286,6 +286,7 @@ def _sharded_runai_weights_iterator(
         run_start: int | None = None
         run_sizes: list[int] = []
         run_tensors: list = []
+        contiguous_chunks = getattr(FileChunks, "contiguous", FileChunks)
 
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
@@ -293,7 +294,7 @@ def _sharded_runai_weights_iterator(
                 # run_start is set whenever a size is appended to run_sizes.
                 assert run_start is not None
                 requests.append(
-                    FileChunks.contiguous(len(requests), path, run_start, run_sizes)
+                    contiguous_chunks(len(requests), path, run_start, run_sizes)
                 )
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
@@ -330,7 +331,7 @@ def _sharded_runai_weights_iterator(
                     # so it is a request of its own.
                     _flush(path)
                     requests.append(
-                        FileChunks.contiguous(
+                        contiguous_chunks(
                             len(requests),
                             path,
                             pos + start * row_bytes,
@@ -386,17 +387,19 @@ def _sharded_runai_weights_iterator(
 
         def _device_sync() -> None:
             try:
-                from torch_tpu._internal import sync as _tpu_sync
-                _tpu_sync.synchronize(wait=True)
+                try:
+                    from torch_tpu._internal import sync as _tpu_sync
+
+                    _tpu_sync.synchronize(wait=True)
+                except ImportError:
+                    pass
                 torch.accelerator.synchronize()
-                import ctypes, gc
-                gc.collect()
-                ctypes.CDLL(None).malloc_trim(0)
             except Exception:
                 logger.warning_once(
                     "[sharded-ep-load] torch.accelerator.synchronize() unavailable "
                     "during load; host memory may accumulate."
                 )
+            trim_host_heap()
 
         progress = tqdm(
             total=kept,
@@ -688,7 +691,7 @@ def _evict_checkpoint_page_cache(files: list[str]) -> None:
         sizes = list(executor.map(_evict_one_checkpoint_file, files))
     evicted_count = sum(s is not None for s in sizes)
     evicted_gb = sum(s for s in sizes if s is not None)
-    gc.collect()
+    trim_host_heap()
     logger.info(
         "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
         evicted_count,

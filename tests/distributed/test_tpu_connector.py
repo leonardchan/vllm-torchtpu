@@ -153,9 +153,9 @@ def _mamba_only_groups():
     [
         # Mamba state rides the state-class tags, not the page transfer.
         (
-            lambda: _make_stage3_hybrid_kv_cache_config(
-                fa_group_index=2
-            ).kv_cache_groups,
+            lambda: (
+                _make_stage3_hybrid_kv_cache_config(fa_group_index=2).kv_cache_groups
+            ),
             False,
             [(2, 16)],
         ),
@@ -188,9 +188,9 @@ def test_stage3_transfer_groups_keeps_each_groups_page_size(
         # request. Unchecked, that disagreement surfaces as a mid-transfer
         # RuntimeError that takes the engine down.
         (
-            lambda: _make_stage3_hybrid_kv_cache_config(
-                fa_group_index=2
-            ).kv_cache_groups,
+            lambda: (
+                _make_stage3_hybrid_kv_cache_config(fa_group_index=2).kv_cache_groups
+            ),
             True,
             "TPU_RAIDEN_DSV4_ADMISSION",
         ),
@@ -6048,6 +6048,499 @@ def test_dsv4_producer_trims_the_block_list_it_registers():
     # One live page, so one page of bytes, not the two the raw table spans.
     declared = {reg.tag: reg.declared_bytes for reg in call["pool_spans"]}
     assert declared["dsv4.csa.nope.g0"] == 131072
+
+
+@pytest.mark.cpu_test
+def test_dsv4_consumer_prefix_hit_slices_each_group_and_rejects_unaligned():
+    """Multi-group prefix-aware load validates prefix alignment against each
+    prefix-cacheable group's page size and rejects an unaligned prefix."""
+    req = MagicMock()
+    req.request_id = "dsv4-suffix"
+    req.num_prompt_tokens = 4096
+    req.num_computed_tokens = 0
+    req.prompt_token_ids = [0] * 4096
+    req.kv_transfer_params = {
+        "req_id": "dsv4-suffix-src",
+        "uuid": 1201,
+        "num_tokens": 4095,
+        "src_controller_address": "prefill-controller.test:27000",
+        "src_job_name": "prefill",
+        "src_engine_id": "producer-engine",
+        "src_data_replica_idx": 0,
+        "src_parallelism": 1,
+        "dst_tp_size": 1,
+        "dst_dcp_size": 1,
+    }
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = (
+        [10, 11, 12, 13],
+        list(range(100, 116)),
+        [0] * 30 + [96, 97],
+    )
+    transfer_groups = (
+        _Stage3TransferGroup(cache_group_index=0, page_tokens=1024, window_tokens=None),
+        _Stage3TransferGroup(cache_group_index=1, page_tokens=256, window_tokens=None),
+        _Stage3TransferGroup(cache_group_index=2, page_tokens=128, window_tokens=128),
+    )
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD", True, create=True),
+        patch(f"{_MOD}._prefix_aware_load_supported", return_value=True),
+        patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+    ):
+        consumer = _make_raiden_scheduler(
+            is_producer=False, block_size=128, enable_prefix_caching=True
+        )
+        consumer._stage3_transfer_groups = transfer_groups
+        matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+        consumer.update_state_after_alloc(req, blocks, matched)
+
+    assert matched == 2047
+    assert is_async
+    load = consumer.reqs_to_load["dsv4-suffix"]
+    assert load.skip_tokens == 2048
+    assert load.local_block_ids == [10, 11, 12, 13]
+    assert load.group_block_ids == [
+        [10, 11, 12, 13],
+        list(range(100, 116)),
+        [0] * 30 + [96, 97],
+    ]
+
+    # A 1280-token prefix aligns with the 256- and 128-token groups when group 0
+    # is 256, but fails closed on a 1024-token secondary group without losing
+    # the full un-sliced local_block_ids on failure.
+    bad_req = MagicMock()
+    bad_req.request_id = "dsv4-unaligned"
+    bad_req.num_prompt_tokens = 4096
+    bad_req.num_computed_tokens = 0
+    bad_req.prompt_token_ids = [0] * 4096
+    bad_req.kv_transfer_params = {
+        "req_id": "dsv4-unaligned-src",
+        "uuid": 1202,
+        "num_tokens": 4095,
+        "src_controller_address": "prefill-controller.test:27000",
+        "src_job_name": "prefill",
+        "src_engine_id": "producer-engine",
+        "src_data_replica_idx": 0,
+        "src_parallelism": 1,
+        "dst_tp_size": 1,
+        "dst_dcp_size": 1,
+    }
+    bad_blocks = MagicMock()
+    bad_blocks.get_block_ids.return_value = (
+        list(range(100, 116)),
+        [10, 11, 12, 13],
+    )
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD", True, create=True),
+        patch(f"{_MOD}._prefix_aware_load_supported", return_value=True),
+        patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+    ):
+        consumer2 = _make_raiden_scheduler(
+            is_producer=False, block_size=128, enable_prefix_caching=True
+        )
+        consumer2._stage3_transfer_groups = (
+            _Stage3TransferGroup(
+                cache_group_index=0, page_tokens=256, window_tokens=None
+            ),
+            _Stage3TransferGroup(
+                cache_group_index=1, page_tokens=1024, window_tokens=None
+            ),
+        )
+        matched2, _ = consumer2.get_num_new_matched_tokens(bad_req, 1280)
+        consumer2.update_state_after_alloc(bad_req, bad_blocks, matched2)
+
+    failed_load = consumer2.reqs_to_load["dsv4-unaligned"]
+    assert failed_load.fail_only
+    assert failed_load.local_block_ids == list(range(100, 116))
+    assert failed_load.group_block_ids is None
+
+
+@pytest.mark.cpu_test
+def test_dsv4_consumer_prefix_hit_clips_each_pool_and_trims_window():
+    """DSv4 consumer submit computes per-pool dst_skip_bytes, slices prefix-hit
+    pages off prefix-cacheable groups, and trims sliding-window groups whole."""
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=False, dp_size=8, block_size=1024
+    )
+    plan, _ = _dsv4_worker_plan(worker)
+    worker._stage3_dsv4_plan = plan
+    worker._raiden_work_unit = MagicMock()
+    facade = _FakeRaidenControllerFacade()
+    worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+
+    # 2048 tokens with skip_tokens=1024: scheduler hands the full block tables
+    # to the worker, which slices the first 1024 tokens off prefix-cacheable
+    # groups and trims the 15 out-of-window null blocks off the SWA group.
+    full_group_block_ids = [
+        [10, 11],
+        [20, 21],
+        list(range(30, 38)),
+        [0] * 15 + [47],
+        [50, 51],
+        [60, 61],
+        list(range(70, 78)),
+    ]
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_load["dsv4-dst-suffix"] = _Stage3LoadMeta(
+        uuid=1203,
+        source_req_id="dsv4-src-suffix",
+        local_block_ids=[10, 11],
+        group_block_ids=full_group_block_ids,
+        num_tokens=2048,
+        skip_tokens=1024,
+        src_controller_address="prefill-controller.test:27000",
+        src_job_name="prefill",
+        src_engine_id="producer-engine",
+        src_data_replica_idx=0,
+        src_parallelism=1,
+    )
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        patch.object(
+            worker,
+            "_require_stage3_controller",
+            return_value=(MagicMock(), "10.0.0.2:28000"),
+        ),
+        patch.object(worker, "_stage3_source_work_units", return_value=[MagicMock()]),
+        patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+    ):
+        worker._submit_stage3_loads(meta, MagicMock())
+        _flush_stage3_submits(worker)
+
+    assert len(facade.start_transfer_calls) == 1
+    call_kwargs = facade.start_transfer_calls[0]
+    assert call_kwargs["transfer_pool_tags"] == [pool.tag for pool in plan]
+    assert call_kwargs["dst_block_counts"] == [1, 1, 1, 4, 1, 1, 1, 4]
+    assert call_kwargs["dst_device_block_ids"] == [
+        11,
+        11,
+        21,
+        34,
+        35,
+        36,
+        37,
+        47,
+        51,
+        61,
+        74,
+        75,
+        76,
+        77,
+    ]
+    assert call_kwargs["dst_skip_bytes"] == [
+        131072,
+        32768,
+        65536,
+        4 * 262144,
+        0,
+        131072,
+        65536,
+        4 * 131072,
+    ]
+
+
+@pytest.mark.cpu_test
+def test_dsv4_consumer_prefix_hit_preserves_slot_ring_state_groups():
+    """Ring-buffer state groups (`slot=True`, `CircularBufferSpec`) keep their
+    single state block unsliced on consumer prefix hits and get dst_skip_bytes=0."""
+    req = MagicMock()
+    req.request_id = "dsv4-slot-suffix"
+    req.num_prompt_tokens = 4096
+    req.num_computed_tokens = 0
+    req.prompt_token_ids = [0] * 4096
+    req.kv_transfer_params = {
+        "req_id": "dsv4-slot-suffix-src",
+        "uuid": 1204,
+        "num_tokens": 4095,
+        "src_controller_address": "prefill-controller.test:27000",
+        "src_job_name": "prefill",
+        "src_engine_id": "producer-engine",
+        "src_data_replica_idx": 0,
+        "src_parallelism": 1,
+        "dst_tp_size": 1,
+        "dst_dcp_size": 1,
+    }
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = (
+        [10, 11, 12, 13],
+        [88],
+    )
+    transfer_groups = (
+        _Stage3TransferGroup(cache_group_index=0, page_tokens=1024, window_tokens=None),
+        # Ring-buffer state group has 1 slot block for the whole request, and its
+        # page_tokens (384) need not divide skip_tokens (2048).
+        _Stage3TransferGroup(
+            cache_group_index=1, page_tokens=384, window_tokens=None, slot=True
+        ),
+    )
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD", True, create=True),
+        patch(f"{_MOD}._prefix_aware_load_supported", return_value=True),
+        patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+    ):
+        consumer = _make_raiden_scheduler(
+            is_producer=False, block_size=128, enable_prefix_caching=True
+        )
+        consumer._stage3_transfer_groups = transfer_groups
+        matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+        consumer.update_state_after_alloc(req, blocks, matched)
+
+    assert matched == 2047
+    assert is_async
+    load = consumer.reqs_to_load["dsv4-slot-suffix"]
+    assert not load.fail_only
+    assert load.skip_tokens == 2048
+    assert load.local_block_ids == [10, 11, 12, 13]
+    assert load.group_block_ids == [[10, 11, 12, 13], [88]]
+
+    # Worker submit preserves the 1-block slot group and sets its dst_skip_bytes to 0.
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=False, dp_size=8, block_size=1024
+    )
+    plan, _ = _dsv4_worker_plan(worker)
+    worker._stage3_dsv4_plan = plan
+    groups = list(worker._stage3_dsv4_transfer_groups)
+    # Mark plan position 4 (tag dsv4.state.csa.g4) as a slot=True ring-state group.
+    groups[4] = _Stage3TransferGroup(
+        cache_group_index=groups[4].cache_group_index,
+        page_tokens=384,
+        window_tokens=None,
+        slot=True,
+    )
+    worker._stage3_dsv4_transfer_groups = tuple(groups)
+    worker._raiden_work_unit = MagicMock()
+    facade = _FakeRaidenControllerFacade()
+    worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+
+    full_slot_group_block_ids = [
+        [10, 11],
+        [20, 21],
+        list(range(30, 38)),
+        [0] * 15 + [47],
+        [88],
+        [60, 61],
+        list(range(70, 78)),
+    ]
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_load["dsv4-dst-slot-suffix"] = _Stage3LoadMeta(
+        uuid=1205,
+        source_req_id="dsv4-src-slot-suffix",
+        local_block_ids=[10, 11],
+        group_block_ids=full_slot_group_block_ids,
+        num_tokens=2048,
+        skip_tokens=1024,
+        src_controller_address="prefill-controller.test:27000",
+        src_job_name="prefill",
+        src_engine_id="producer-engine",
+        src_data_replica_idx=0,
+        src_parallelism=1,
+    )
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        patch.object(
+            worker,
+            "_require_stage3_controller",
+            return_value=(MagicMock(), "10.0.0.2:28000"),
+        ),
+        patch.object(worker, "_stage3_source_work_units", return_value=[MagicMock()]),
+        patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+    ):
+        worker._submit_stage3_loads(meta, MagicMock())
+        _flush_stage3_submits(worker)
+
+    assert len(facade.start_transfer_calls) == 1
+    call_kwargs = facade.start_transfer_calls[0]
+    assert call_kwargs["dst_block_counts"] == [1, 1, 1, 4, 1, 1, 1, 4]
+    assert call_kwargs["dst_device_block_ids"] == [
+        11,
+        11,
+        21,
+        34,
+        35,
+        36,
+        37,
+        47,
+        88,
+        61,
+        74,
+        75,
+        76,
+        77,
+    ]
+    assert call_kwargs["dst_skip_bytes"] == [
+        131072,
+        32768,
+        65536,
+        4 * 262144,
+        0,
+        0,
+        65536,
+        4 * 131072,
+    ]
+
+    # Invalid slot group block tables (empty, >1 block, or null block 0) fail
+    # closed and preserve the full unsliced local_block_ids on failure.
+    for idx, bad_slot_ids in enumerate(([], [88, 89], [0])):
+        bad_req = MagicMock()
+        bad_req.request_id = f"dsv4-bad-slot-{idx}"
+        bad_req.num_prompt_tokens = 4096
+        bad_req.num_computed_tokens = 0
+        bad_req.prompt_token_ids = [0] * 4096
+        bad_req.kv_transfer_params = {
+            "req_id": f"dsv4-bad-slot-src-{idx}",
+            "uuid": 1210 + idx,
+            "num_tokens": 4095,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 1,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
+        }
+        bad_blocks = MagicMock()
+        bad_blocks.get_block_ids.return_value = ([10, 11, 12, 13], bad_slot_ids)
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD", True, create=True),
+            patch(f"{_MOD}._prefix_aware_load_supported", return_value=True),
+            patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+        ):
+            bad_consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=128, enable_prefix_caching=True
+            )
+            bad_consumer._stage3_transfer_groups = transfer_groups
+            bad_matched, _ = bad_consumer.get_num_new_matched_tokens(bad_req, 2048)
+            bad_consumer.update_state_after_alloc(bad_req, bad_blocks, bad_matched)
+        failed = bad_consumer.reqs_to_load[bad_req.request_id]
+        assert failed.fail_only
+        assert failed.local_block_ids == [10, 11, 12, 13]
+        assert failed.group_block_ids is None
+
+        # Worker-side _stage3_dsv4_group_blocks also rejects invalid slot tables.
+        bad_worker_meta = SimpleNamespace(
+            group_block_ids=list(full_slot_group_block_ids[:4])
+            + [bad_slot_ids]
+            + list(full_slot_group_block_ids[5:]),
+            skip_tokens=1024,
+        )
+        with pytest.raises(ValueError, match="Stage-3 ring-buffer state group"):
+            worker._stage3_dsv4_group_blocks(bad_worker_meta, 2048)
+
+    # Also verify a slot=True group at index 0 (primary group) is preserved
+    # unsliced while subsequent paged groups are prefix-sliced.
+    slot_first_req = MagicMock()
+    slot_first_req.request_id = "dsv4-slot-first-suffix"
+    slot_first_req.num_prompt_tokens = 4096
+    slot_first_req.num_computed_tokens = 0
+    slot_first_req.prompt_token_ids = [0] * 4096
+    slot_first_req.kv_transfer_params = {
+        "req_id": "dsv4-slot-first-src",
+        "uuid": 1220,
+        "num_tokens": 4095,
+        "src_controller_address": "prefill-controller.test:27000",
+        "src_job_name": "prefill",
+        "src_engine_id": "producer-engine",
+        "src_data_replica_idx": 0,
+        "src_parallelism": 1,
+        "dst_tp_size": 1,
+        "dst_dcp_size": 1,
+    }
+    slot_first_blocks = MagicMock()
+    slot_first_blocks.get_block_ids.return_value = ([88], [10, 11, 12, 13])
+    slot_first_groups = (
+        _Stage3TransferGroup(
+            cache_group_index=0, page_tokens=384, window_tokens=None, slot=True
+        ),
+        _Stage3TransferGroup(cache_group_index=1, page_tokens=1024, window_tokens=None),
+    )
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD", True, create=True),
+        patch(f"{_MOD}._prefix_aware_load_supported", return_value=True),
+        patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+    ):
+        slot_first_consumer = _make_raiden_scheduler(
+            is_producer=False, block_size=128, enable_prefix_caching=True
+        )
+        slot_first_consumer._stage3_transfer_groups = slot_first_groups
+        matched_sf, _ = slot_first_consumer.get_num_new_matched_tokens(
+            slot_first_req, 2048
+        )
+        slot_first_consumer.update_state_after_alloc(
+            slot_first_req, slot_first_blocks, matched_sf
+        )
+    slot_first_load = slot_first_consumer.reqs_to_load["dsv4-slot-first-suffix"]
+    assert not slot_first_load.fail_only
+    assert slot_first_load.skip_tokens == 2048
+    assert slot_first_load.local_block_ids == [88]
+    assert slot_first_load.group_block_ids == [[88], [10, 11, 12, 13]]
+
+    # Leader-submission path (_submit_stage3_load_as_leader) also populates per-group
+    # DSv4 tags/blocks/counts and skips 0 bytes for slot=True groups.
+    facade.start_transfer_calls.clear()
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION", True, create=True),
+        patch.object(worker, "_stage3_source_work_units", return_value=[MagicMock()]),
+        patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+    ):
+        leader_status, _, leader_err, leader_skip, leader_fa_skip = (
+            worker._submit_stage3_load_as_leader(
+                req_meta=meta.reqs_to_load["dsv4-dst-slot-suffix"],
+                source_req_id="dsv4-src-slot-suffix",
+                destination_req_id="dsv4-dst-slot-suffix",
+                uuid=1205,
+                num_tokens=2048,
+                local_blocks=[10, 11],
+                dst_controller_address="10.0.0.2:28000",
+                dst_units=[MagicMock()],
+            )
+        )
+    assert leader_status == "accepted", leader_err
+    assert leader_skip == 1024
+    assert leader_fa_skip == 131072
+    leader_kwargs = facade.start_transfer_calls[-1]
+    assert leader_kwargs["dst_block_counts"] == [1, 1, 1, 4, 1, 1, 1, 4]
+    assert leader_kwargs["dst_skip_bytes"] == call_kwargs["dst_skip_bytes"]
+
+    # Verify skips_prefix_replay and _stage3_bounded_replay exact-load gating,
+    # plus multi-group failed_recving reporting via get_transfer_results().
+    req.kv_transfer_params.pop("_remote_kv_processed", None)
+    consumer._stage3_bounded_replay = True
+    assert consumer._stage3_exact_loads_enabled()
+    with patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True):
+        matched_exact, _ = consumer.get_num_new_matched_tokens(req, 1024)
+    assert matched_exact == 3071
+    assert consumer.skips_prefix_replay(req)
+
+    connector_obj = TPUConnector.__new__(TPUConnector)
+    connector_obj.use_raiden = True
+    connector_obj._stage3_transfer_groups = transfer_groups
+    connector_obj.connector_scheduler = consumer
+    connector_obj.connector_worker = SimpleNamespace(
+        get_finished=lambda ids: (set(), {"dsv4-dst-slot-suffix", "dsv4-failed-req"}),
+        _failed_recving={"dsv4-failed-req"},
+        get_block_ids_with_load_errors=lambda: {999},
+    )
+    with patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True):
+        assert connector_obj.skips_prefix_replay(req)
+        results = connector_obj.get_transfer_results(set())
+        assert results.finished_recving == {"dsv4-dst-slot-suffix", "dsv4-failed-req"}
+        assert results.failed_recving == {"dsv4-failed-req"}
+        assert connector_obj.get_block_ids_with_load_errors() == set()
 
 
 class TestPipelineParallelProducer:
