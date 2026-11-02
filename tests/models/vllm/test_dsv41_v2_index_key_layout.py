@@ -117,6 +117,23 @@ def test_halfplane_refuses_unsupported_transfer_and_offload(
         indexer_cache.IndexerCache()
 
 
+@pytest.mark.cpu_test
+def test_raiden_transfer_allows_packed_fp8_and_bf16_indexer():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_cache
+
+    raiden = SimpleNamespace(kv_connector="TPURaidenConnector")
+    cfg_auto = SimpleNamespace(
+        kv_transfer_config=raiden,
+        attention_config=SimpleNamespace(resolve_indexer_kv_dtype=lambda d: d),
+    )
+    cfg_bf16 = SimpleNamespace(
+        kv_transfer_config=raiden,
+        attention_config=SimpleNamespace(resolve_indexer_kv_dtype=lambda _: "bf16"),
+    )
+    assert indexer_cache.indexer_uses_fp8(cfg_auto) is True
+    assert indexer_cache.indexer_uses_fp8(cfg_bf16) is False
+
+
 def test_halfplane_cpu_writer_matches_legacy_nan_canonicalization():
     cache = _cache()
     bits = torch.tensor([0x7F81, 0x7FC1, -127, -63] * 32, dtype=torch.int16)
