@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import torch
+import vllm.distributed.kv_transfer.kv_connector.v1.base as _kv_v1_base
+import vllm.v1.kv_cache_interface as _kv_iface
 from torch_tpu._internal.batch_transfer import (
     batch_transfer_d2h,
     batch_transfer_d2h_sync,
@@ -96,6 +98,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+CircularBufferSpec = getattr(_kv_iface, "CircularBufferSpec", ())
 
 __all__ = [
     "TPUConnector",
@@ -177,11 +180,64 @@ class _Stage3TransferGroup:
     A cache group is the set of layers the scheduler pages together: one
     request gets one block table per group, and every layer in the group
     reads the same page numbers.
+
+    Attributes:
+        cache_group_index: Index of this group in `kv_cache_config.kv_cache_groups`.
+        page_tokens: Number of tokens per block (or ring-buffer capacity when
+            `slot=True`).
+        window_tokens: Attention sliding-window size in tokens, or `None` for
+            unwindowed groups.
+        slot: True when the group is a single-block ring-buffer state slot
+            (`CircularBufferSpec`, e.g., DSv4.1 compressor state) that is
+            always transferred whole rather than paged or window-trimmed.
+        prefix_cacheable: Whether the group participates in decode prefix
+            caching. Defaults to `not slot and window_tokens is None`; on a
+            prefix hit, Stage 3 skips cached prefix pages only in
+            prefix-cacheable groups and transfers windowed or `slot` groups
+            whole.
     """
 
     cache_group_index: int
     page_tokens: int
     window_tokens: int | None = None
+    slot: bool = False
+    prefix_cacheable: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.prefix_cacheable is None:
+            object.__setattr__(
+                self,
+                "prefix_cacheable",
+                not self.slot and self.window_tokens is None,
+            )
+
+
+def _stage3_slot_block(block_ids: Sequence[int], *, group_label: str) -> list[int]:
+    """The single state block of a ring-buffer group, validated.
+
+    The contract is exactly one block per request: `CircularBufferSpec`
+    allocates one slot block for the request's whole life. A table with more
+    entries means the allocator's contract changed (for example a
+    speculative-decoding slot); keeping only the first block would ship part
+    of the state, so the table is rejected rather than trimmed.
+    """
+    ids = [int(block_id) for block_id in block_ids]
+    if not ids:
+        raise ValueError(
+            f"Stage-3 ring-buffer state group {group_label} has no block: "
+            "the allocator must hand each request exactly one state slot"
+        )
+    if len(ids) != 1:
+        raise ValueError(
+            f"Stage-3 ring-buffer state group {group_label} must have exactly "
+            f"one state block, got {len(ids)}: ids={ids}"
+        )
+    if ids[0] == _STAGE3_NULL_BLOCK_ID:
+        raise ValueError(
+            f"Stage-3 ring-buffer state group {group_label} points at the null "
+            f"block: ids={ids}"
+        )
+    return ids
 
 
 # vLLM reserves block 0 as the null block and points every freed sliding-window
@@ -279,6 +335,20 @@ def _stage3_group_window_tokens(group_spec: Any) -> int | None:
     return int(window) if window else None
 
 
+def _stage3_group_prefix_cacheable(
+    group_spec: Any, *, window_tokens: int | None
+) -> bool:
+    """Whether a cache group retains prefix pages across Stage-3 P/D loads."""
+    if window_tokens is not None or isinstance(group_spec, CircularBufferSpec):
+        return False
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    if specs:
+        group_spec = next(iter(specs.values()))
+    if isinstance(group_spec, CircularBufferSpec):
+        return False
+    return bool(getattr(group_spec, "prefix_cacheable", True))
+
+
 def _stage3_transfer_groups(
     kv_cache_groups: Sequence[Any],
     *,
@@ -303,7 +373,20 @@ def _stage3_transfer_groups(
         _Stage3TransferGroup(
             cache_group_index=index,
             page_tokens=int(group.kv_cache_spec.block_size),
-            window_tokens=_stage3_group_window_tokens(group.kv_cache_spec),
+            window_tokens=(
+                None
+                if isinstance(group.kv_cache_spec, CircularBufferSpec)
+                else _stage3_group_window_tokens(group.kv_cache_spec)
+            ),
+            slot=isinstance(group.kv_cache_spec, CircularBufferSpec),
+            prefix_cacheable=_stage3_group_prefix_cacheable(
+                group.kv_cache_spec,
+                window_tokens=(
+                    None
+                    if isinstance(group.kv_cache_spec, CircularBufferSpec)
+                    else _stage3_group_window_tokens(group.kv_cache_spec)
+                ),
+            ),
         )
         for index, group in enumerate(kv_cache_groups)
         if not isinstance(group.kv_cache_spec, MambaSpec)
@@ -804,6 +887,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
                     stage3_mamba_num_speculative_blocks
                 )
+                self.connector_scheduler._stage3_bounded_replay = any(
+                    getattr(group.kv_cache_spec, "prefix_replay_tokens", 0) > 0
+                    for group in kv_cache_config.kv_cache_groups
+                )
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -989,13 +1076,58 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def skips_prefix_replay(self, request: "Request") -> bool:
+        """Read by the (patched) vLLM scheduler: this request's load restores
+        its exact KV state, so it is not rounded down nor replayed."""
+        scheduler = self.connector_scheduler
+        fn = getattr(scheduler, "skips_prefix_replay", None)
+        return bool(fn is not None and fn(request))
+
+    def get_transfer_results(self, finished_req_ids: set[str]) -> Any:
+        finished_sending, finished_recving = self.get_finished(finished_req_ids)
+        failed_recving: set[str] = set()
+        if self._stage3_reports_failed_requests():
+            # Failed receives are already in finished_recving; naming them
+            # here lets the scheduler recompute those requests whole.
+            failed_recving = set(finished_recving or ()) & set(
+                getattr(self.connector_worker, "_failed_recving", ())
+            )
+        results_cls = getattr(_kv_v1_base, "KVConnectorTransferResults", None)
+        if results_cls is not None:
+            return results_cls(
+                finished_sending=set(finished_sending or ()),
+                finished_recving=set(finished_recving or ()),
+                failed_recving=failed_recving,
+            )
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            finished_sending=set(finished_sending or ()),
+            finished_recving=set(finished_recving or ()),
+            failed_recving=failed_recving,
+        )
+
+    def _stage3_reports_failed_requests(self) -> bool:
+        """Block IDs are only unique within a group, so a model with several
+        transferred groups must report failed loads per request; vLLM raises
+        on invalid_block_ids for such models and the engine dies."""
+        return (
+            self.use_raiden
+            and _use_raiden_stage3_transport()
+            and len(self._stage3_transfer_groups) > 1
+        )
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Surface KV-load failures so the scheduler recomputes the affected
         # blocks instead of running with absent KV. Only the Raiden worker
         # tracks these; other backends fall back to the base (no errors).
         worker = self.connector_worker
         fn = getattr(worker, "get_block_ids_with_load_errors", None)
-        return fn() if fn is not None else set()
+        failed = fn() if fn is not None else set()
+        if self._stage3_reports_failed_requests():
+            # Drained above; the requests travel in failed_recving instead.
+            return set()
+        return failed
 
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
         """Scopes Stage-3 load errors to the one transferred FA group."""
@@ -1464,6 +1596,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
+        # Set by TPUConnector: DSv4.1 SWA bounded replay is on.
+        self._stage3_bounded_replay = False
+        # Decoder: req_id -> block-aligned local prefix hit seen by
+        # get_num_new_matched_tokens, read back after allocation.
+        self._stage3_local_hit_tokens: dict[str, int] = {}
+        # Decoder: requests whose load restores the exact KV state; the
+        # scheduler neither rounds nor replays them (skips_prefix_replay).
+        self._stage3_exact_load_reqs: set[str] = set()
         # Decoder: prefill (source) req_id -> the admitted destination
         # req_id.
         self._stage3_active_source_req_ids: dict[str, str] = {}
@@ -1615,6 +1755,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # Do not replace it with prompt length here.
             transfer_tokens = request.kv_transfer_params["num_tokens"]
             count = max(transfer_tokens - num_computed_tokens, 0)
+            self._stage3_local_hit_tokens[request.request_id] = int(num_computed_tokens)
+            if count > 0 and self._stage3_exact_loads_enabled():
+                self._stage3_exact_load_reqs.add(request.request_id)
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
             return count, count > 0
@@ -1728,6 +1871,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         num_external_tokens: int,
     ) -> None:
         """Declares a destination transfer without source physical IDs."""
+        local_hit_tokens = self._stage3_local_hit_tokens.pop(request.request_id, 0)
         if num_external_tokens <= 0:
             # First admission with a full local prefix hit: nothing to pull,
             # but the producer holds a request-block registration pinned until
@@ -1790,15 +1934,28 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             )
 
         expected_pages = (num_tokens + primary_page_tokens - 1) // primary_page_tokens
-        reason = _incomplete_pages(local_block_ids, primary_page_tokens)
-        if reason is not None:
-            self._fail_load(request, local_block_ids, reason)
-            return
+        primary_is_slot = bool(multi_group and self._stage3_transfer_groups[0].slot)
+        if not primary_is_slot:
+            reason = _incomplete_pages(local_block_ids, primary_page_tokens)
+            if reason is not None:
+                self._fail_load(request, local_block_ids, reason)
+                return
         group_block_ids: list[list[int]] | None = None
         if multi_group:
             group_block_ids = []
             for group in self._stage3_transfer_groups:
                 ids = list(grouped_block_ids[group.cache_group_index])
+                if group.slot:
+                    try:
+                        group_block_ids.append(
+                            _stage3_slot_block(
+                                ids, group_label=f"g{group.cache_group_index}"
+                            )
+                        )
+                    except ValueError as exc:
+                        self._fail_load(request, local_block_ids, str(exc))
+                        return
+                    continue
                 reason = _incomplete_pages(ids, group.page_tokens)
                 if reason is not None:
                     self._fail_load(request, local_block_ids, reason)
@@ -1813,15 +1970,28 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"external={external_tokens}, num_tokens={num_tokens}",
             )
             return
-        # TODO: turn on prefix-aware loads for DSv4. The current path assumes
-        # an `fa` pool tag, one page size, and one block table, and DSv4 has
-        # none of those.
-        skip_tokens = (
-            num_tokens - external_tokens
-            if (self._stage3_prefix_aware_load_enabled and not multi_group)
-            else 0
-        )
-        if skip_tokens:
+        if multi_group and self._stage3_prefix_aware_load_enabled:
+            # DSv4: the local hit's pages of the prefix-cacheable groups stay;
+            # everything past it, plus the sliding-window and ring groups at
+            # the producer's length, travels.
+            skip_tokens = (
+                int(local_hit_tokens)
+                if self._stage3_bounded_replay
+                else num_tokens - external_tokens
+            )
+            reason = self._stage3_dsv4_skip_reason(
+                skip_tokens, external_tokens, num_tokens
+            )
+            if reason is not None:
+                self._fail_load(request, local_block_ids, reason)
+                return
+        else:
+            skip_tokens = (
+                num_tokens - external_tokens
+                if (self._stage3_prefix_aware_load_enabled and not multi_group)
+                else 0
+            )
+        if skip_tokens and not multi_group:
             # Partial local prefix hit: pull only the suffix, and only into
             # the trailing (newly allocated) pages — the leading adopted
             # cache pages are shared and must never be transfer targets.
@@ -1926,6 +2096,48 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return None
         return normalized
 
+    def _stage3_exact_loads_enabled(self) -> bool:
+        """DSv4 loads restore the exact KV state under SWA bounded replay.
+
+        Bounded replay rounds a load down to a scheduler block and recomputes
+        the hit's last window afterwards, a few hundred tokens of local
+        prefill on every request. Instead the load carries the
+        prefix-cacheable groups from the local hit to the producer's length
+        and the sliding-window and ring groups whole, and the scheduler
+        resumes at that length (`skips_prefix_replay`).
+        """
+        return (
+            self._stage3_bounded_replay
+            and self._stage3_prefix_aware_load_enabled
+            and len(self._stage3_transfer_groups) > 1
+        )
+
+    def skips_prefix_replay(self, request: "Request") -> bool:
+        return request.request_id in self._stage3_exact_load_reqs
+
+    def _stage3_dsv4_skip_reason(
+        self, skip_tokens: int, external_tokens: int, num_tokens: int
+    ) -> str | None:
+        """Why a DSv4 load cannot skip `skip_tokens` local tokens, or None."""
+        if skip_tokens + external_tokens != num_tokens:
+            return (
+                "Stage-3 DSv4 load must end at the producer's length: "
+                f"local_hit={skip_tokens}, external={external_tokens}, "
+                f"num_tokens={num_tokens}"
+            )
+        for group in self._stage3_transfer_groups:
+            if (
+                group.prefix_cacheable
+                and not group.slot
+                and skip_tokens % group.page_tokens
+            ):
+                return (
+                    f"Stage-3 DSv4 local hit {skip_tokens} is not aligned to "
+                    f"group g{group.cache_group_index}'s "
+                    f"{group.page_tokens}-token pages"
+                )
+        return None
+
     def _fail_load(
         self, request: "Request", local_block_ids: list[int], reason: str
     ) -> None:
@@ -2015,6 +2227,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> tuple[bool, dict[str, Any] | None]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
+        self._stage3_local_hit_tokens.pop(request.request_id, None)
+        self._stage3_exact_load_reqs.discard(request.request_id)
         if not self.is_producer:
             params = request.kv_transfer_params
             if isinstance(params, dict) and params.get(_KV_PARAMS_ADMITTED):
@@ -4242,6 +4456,16 @@ class TPURaidenConnectorWorker:
             )
         trimmed: list[_Stage3Dsv4GroupPages] = []
         for group, ids in zip(groups, group_block_ids):
+            if group.slot:
+                trimmed.append(
+                    _Stage3Dsv4GroupPages(
+                        pages=_stage3_slot_block(
+                            ids, group_label=f"g{group.cache_group_index}"
+                        ),
+                        num_tokens=int(group.page_tokens),
+                    )
+                )
+                continue
             pages = _stage3_trim_window_pages(
                 ids,
                 num_tokens=num_tokens,
@@ -4257,6 +4481,119 @@ class TPURaidenConnectorWorker:
                 )
             )
         return trimmed
+
+    def _stage3_dsv4_skipped_pages(self, req_meta: Any, pool: Any) -> int:
+        """Leading pages of `pool` the decode-local prefix hit already holds.
+
+        Only prefix-cacheable groups keep hit pages; the sliding-window and
+        ring groups are rebuilt from the producer whole. The producer
+        declares a group's pages back to back in one byte space, so the
+        same count, times the page's live bytes, is the tag's dst_skip_bytes.
+        """
+        skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+        group = self._stage3_dsv4_transfer_groups[pool.plan_position]
+        if not skip_tokens or group.slot or not group.prefix_cacheable:
+            return 0
+        return skip_tokens // int(pool.page_tokens)
+
+    def _stage3_dsv4_skip_bytes(self, req_meta: Any) -> list[int]:
+        """Per-tag dst_skip_bytes of a DSv4 load, in receive-plan order."""
+        return [
+            self._stage3_dsv4_skipped_pages(req_meta, pool)
+            * int(pool.live_bytes_per_block)
+            for pool in self._stage3_dsv4_plan
+        ]
+
+    def _stage3_consumer_transfer_plan(
+        self,
+        req_meta: Any,
+        *,
+        num_tokens: int,
+        local_blocks: Sequence[int],
+    ) -> tuple[list[str], list[int], list[int], int, int, dict[str, Any]]:
+        """Builds the consumer transfer descriptors and prefix-skip kwargs."""
+        if _use_raiden_dsv4_admission():
+            group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+            transfer_tags: list[str] = []
+            dst_blocks: list[int] = []
+            dst_counts: list[int] = []
+            for pool in self._stage3_dsv4_plan:
+                pages = group_blocks[pool.plan_position].pages
+                pages = pages[self._stage3_dsv4_skipped_pages(req_meta, pool) :]
+                transfer_tags.append(pool.tag)
+                dst_blocks.extend(pages)
+                dst_counts.append(len(pages))
+        else:
+            transfer_tags = (
+                list(self._stage3_row_geometry)
+                if _use_raiden_glm_admission()
+                else self._stage3_fa_registration_tags()
+            )
+            dst_blocks = list(local_blocks) * len(transfer_tags)
+            dst_counts = [len(local_blocks)] * len(transfer_tags)
+        fa_tag_count = len(transfer_tags)
+        mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids", None)
+        if self._stage3_state_group_count:
+            if (
+                not mamba_state_block_ids
+                or len(mamba_state_block_ids) != self._stage3_state_group_count
+            ):
+                raise RuntimeError(
+                    "GDN state load requires one destination state "
+                    "block per mamba group"
+                )
+            for tag, ordinal in self._stage3_state_registration_tags():
+                transfer_tags.append(tag)
+                dst_blocks.append(int(mamba_state_block_ids[ordinal]))
+                dst_counts.append(1)
+        skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
+        fa_skip_bytes = 0
+        clip_kwargs: dict[str, Any] = {}
+        if skip_tokens > 0:
+            if _use_raiden_dsv4_admission():
+                dsv4_skip_bytes = self._stage3_dsv4_skip_bytes(req_meta)
+                fa_skip_bytes = next((b for b in dsv4_skip_bytes if b > 0), 0)
+                clip_kwargs["dst_skip_bytes"] = dsv4_skip_bytes + [0] * (
+                    len(transfer_tags) - fa_tag_count
+                )
+            elif _raiden_seq_on_lane_layout():
+                from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
+                    sol_fa_geometry_from_manifest,
+                    sol_fa_skip_bytes,
+                )
+
+                dcp_size = int(
+                    self.vllm_config.parallel_config.decode_context_parallel_size
+                )
+                if skip_tokens % (
+                    int(self.vllm_config.cache_config.block_size) * dcp_size
+                ):
+                    raise ValueError("DCP prefix must cover whole scheduler blocks")
+                fa_skip_bytes = sol_fa_skip_bytes(
+                    skip_tokens // dcp_size,
+                    geometry=sol_fa_geometry_from_manifest(self._raiden_manifest),
+                    # This manifest already describes local TP heads.
+                    dst_shards=1,
+                )
+                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                    len(transfer_tags) - fa_tag_count
+                )
+            else:
+                token_bytes = self._stage3_fa_token_bytes(
+                    int(self.vllm_config.cache_config.block_size)
+                )
+                fa_skip_bytes = skip_tokens * token_bytes
+                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                    len(transfer_tags) - fa_tag_count
+                )
+        return (
+            transfer_tags,
+            dst_blocks,
+            dst_counts,
+            skip_tokens,
+            fa_skip_bytes,
+            clip_kwargs,
+        )
 
     def _register_stage3_request_blocks_dsv4(
         self, metadata: TPUConnectorMetadata
@@ -5203,59 +5540,18 @@ class TPURaidenConnectorWorker:
             # order fixes the H2D order ranks executor-side (the first
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
-            if _use_raiden_dsv4_admission():
-                # Each DSv4 tag replays over its own group's pages rather than
-                # one shared list. Disjoint block IDs are the only thing
-                # separating the caches that alias one array.
-                group_blocks = self._stage3_dsv4_group_blocks(
-                    req_meta, pending.num_tokens
-                )
-                transfer_tags = []
-                dst_blocks = []
-                dst_counts = []
-                for pool in self._stage3_dsv4_plan:
-                    pages = group_blocks[pool.plan_position].pages
-                    transfer_tags.append(pool.tag)
-                    dst_blocks.extend(pages)
-                    dst_counts.append(len(pages))
-            else:
-                if _use_raiden_glm_admission():
-                    transfer_tags = list(self._stage3_row_geometry)
-                else:
-                    transfer_tags = self._stage3_fa_registration_tags()
-                dst_blocks = list(local_blocks) * len(transfer_tags)
-                dst_counts = [len(local_blocks)] * len(transfer_tags)
-            fa_tag_count = len(transfer_tags)
-            mamba_state_block_ids = req_meta.mamba_state_block_ids
-            if self._stage3_state_group_count:
-                if (
-                    not mamba_state_block_ids
-                    or len(mamba_state_block_ids) != self._stage3_state_group_count
-                ):
-                    raise RuntimeError(
-                        "GDN state load requires one destination state "
-                        "block per mamba group"
-                    )
-                for tag, ordinal in self._stage3_state_registration_tags():
-                    transfer_tags.append(tag)
-                    dst_blocks.append(int(mamba_state_block_ids[ordinal]))
-                    dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
-            skip_tokens = req_meta.skip_tokens
-            fa_skip_bytes = 0
-            clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
-                token_bytes = self._stage3_fa_token_bytes(
-                    int(self.vllm_config.cache_config.block_size)
-                )
-                fa_skip_bytes = skip_tokens * token_bytes
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
-                    len(transfer_tags) - fa_tag_count
-                )
+            (
+                transfer_tags,
+                dst_blocks,
+                dst_counts,
+                skip_tokens,
+                fa_skip_bytes,
+                clip_kwargs,
+            ) = self._stage3_consumer_transfer_plan(
+                req_meta,
+                num_tokens=pending.num_tokens,
+                local_blocks=local_blocks,
+            )
             dst_mem_type = self._raiden_hbm_memory_type()
         except Exception as exc:  # pylint: disable=broad-except
             # Local staging failed before any controller contact, so no
@@ -5727,64 +6023,18 @@ class TPURaidenConnectorWorker:
             # order fixes the H2D order ranks executor-side (the first
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
-            transfer_tags = (
-                list(self._stage3_row_geometry)
-                if _use_raiden_glm_admission()
-                else self._stage3_fa_registration_tags()
+            (
+                transfer_tags,
+                dst_blocks,
+                dst_counts,
+                skip_tokens,
+                fa_skip_bytes,
+                clip_kwargs,
+            ) = self._stage3_consumer_transfer_plan(
+                req_meta,
+                num_tokens=num_tokens,
+                local_blocks=local_blocks,
             )
-            fa_tag_count = len(transfer_tags)
-            dst_blocks = list(local_blocks) * len(transfer_tags)
-            dst_counts = [len(local_blocks)] * len(transfer_tags)
-            mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids", None)
-            if self._stage3_state_group_count:
-                if (
-                    not mamba_state_block_ids
-                    or len(mamba_state_block_ids) != self._stage3_state_group_count
-                ):
-                    raise RuntimeError(
-                        "GDN state load requires one destination state "
-                        "block per mamba group"
-                    )
-                for tag, ordinal in self._stage3_state_registration_tags():
-                    transfer_tags.append(tag)
-                    dst_blocks.append(int(mamba_state_block_ids[ordinal]))
-                    dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
-            skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
-            fa_skip_bytes = 0
-            clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
-                if _raiden_seq_on_lane_layout():
-                    from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
-                        sol_fa_geometry_from_manifest,
-                        sol_fa_skip_bytes,
-                    )
-
-                    dcp_size = int(
-                        self.vllm_config.parallel_config.decode_context_parallel_size
-                    )
-                    if skip_tokens % (
-                        int(self.vllm_config.cache_config.block_size) * dcp_size
-                    ):
-                        raise ValueError("DCP prefix must cover whole scheduler blocks")
-                    fa_skip_bytes = sol_fa_skip_bytes(
-                        skip_tokens // dcp_size,
-                        geometry=sol_fa_geometry_from_manifest(self._raiden_manifest),
-                        # This manifest already describes local TP heads.
-                        dst_shards=1,
-                    )
-                else:
-                    token_bytes = self._stage3_fa_token_bytes(
-                        int(self.vllm_config.cache_config.block_size)
-                    )
-                    fa_skip_bytes = skip_tokens * token_bytes
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
-                    len(transfer_tags) - fa_tag_count
-                )
             start_submit = time.perf_counter()
             controller_contacted = True
             accepted = self._start_stage3_transfer_with_d5_retry(
