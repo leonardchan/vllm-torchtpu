@@ -1380,6 +1380,13 @@ DSV4_CSA_COMPRESS_RATIO = 4
 # Halfplane Index-K: records per int32[128] owner row (see
 # vllm_torchtpu.kernels.deepseek_v41.index_key_layout.SLOTS).
 DSV41_INDEX_RECORDS_PER_ROW = 2
+# Packed FP8 Index-K (#2573): 128 FP8 bytes + 4-byte FP32 scale = 132 B/record,
+# stored transposed across 33 fields in whole 512-byte (128-word) owner rows
+# (see vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache).
+DSV41_PACKED_FP8_INDEX_RECORD_BYTES = 132
+DSV41_PACKED_FP8_INDEX_FIELDS = 33
+DSV41_OWNER_ROW_WORDS = 128
+DSV41_OWNER_ROW_BYTES = DSV41_OWNER_ROW_WORDS * 4
 
 _DSV4_STATE_TAG_BY_KV_TAG = {
     TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
@@ -1765,33 +1772,62 @@ def _build_dsv41_pool_manifest(
                         )
                     )
                 continue
+            live_bytes = rows * row_bytes
+            unit_rows, unit_bytes = rows, row_bytes
+            if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
+                if row_bytes == DSV41_PACKED_FP8_INDEX_RECORD_BYTES:
+                    # Packed FP8 Index-K transposes `rows` records across 33
+                    # fields (32x4 FP8 channels + 1 FP32 scale at field 32)
+                    # rounded up to whole 512-byte owner rows. Every record `c`
+                    # writes across all 33 fields (`word = f * rows + c`), so a
+                    # non-empty page (including a partial tail page) must travel
+                    # as one indivisible `live_bytes` unit; unwritten columns
+                    # are masked by `seq_lens` on the consumer.
+                    if (
+                        rows < 1
+                        or (rows & (rows - 1))
+                        or offset_bytes % DSV41_OWNER_ROW_BYTES
+                        or stride_bytes % DSV41_OWNER_ROW_BYTES
+                    ):
+                        raise ManifestError(
+                            f"DSv4.1 packed FP8 Index-K cache {layer_name!r} "
+                            f"requires power-of-two rows and 512-byte aligned "
+                            f"offset/stride: rows={rows}, offset={offset_bytes}, "
+                            f"stride={stride_bytes}"
+                        )
+                    page_rows = (
+                        DSV41_PACKED_FP8_INDEX_FIELDS * rows
+                        + DSV41_OWNER_ROW_WORDS
+                        - 1
+                    ) // DSV41_OWNER_ROW_WORDS
+                    live_bytes = page_rows * DSV41_OWNER_ROW_BYTES
+                    unit_rows, unit_bytes = 1, live_bytes
+                else:
+                    # Halfplane Index-K packs two records into each int32[128]
+                    # owner row (low/high 16 bits of every word), so a record is
+                    # not a byte range of its own: half a row carries half the
+                    # channels of both records. A page still covers whole owner
+                    # rows (IndexCacheRows enforces even rows, offset and stride),
+                    # so it travels as owner rows and a partial tail rounds up to
+                    # a whole row; the extra record is an unused sibling slot.
+                    slots = DSV41_INDEX_RECORDS_PER_ROW
+                    if rows % slots or offset_bytes % (row_bytes * slots) or (
+                        stride_bytes % (row_bytes * slots)
+                    ):
+                        raise ManifestError(
+                            f"DSv4.1 Index-K cache {layer_name} pages must cover whole "
+                            f"{slots}-record owner rows: rows={rows}, "
+                            f"offset={offset_bytes}, stride={stride_bytes}"
+                        )
+                    unit_rows, unit_bytes = rows // slots, row_bytes * slots
             _claim_range(
                 group_index,
                 storage_index,
                 offset_bytes,
-                rows * row_bytes,
+                live_bytes,
                 stride_bytes,
                 layer_name,
             )
-            unit_rows, unit_bytes = rows, row_bytes
-            if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
-                # Halfplane Index-K packs two records into each int32[128]
-                # owner row (low/high 16 bits of every word), so a record is
-                # not a byte range of its own: half a row carries half the
-                # channels of both records. A page still covers whole owner
-                # rows (IndexCacheRows enforces even rows, offset and stride),
-                # so it travels as owner rows and a partial tail rounds up to
-                # a whole row; the extra record is an unused sibling slot.
-                slots = DSV41_INDEX_RECORDS_PER_ROW
-                if rows % slots or offset_bytes % (row_bytes * slots) or (
-                    stride_bytes % (row_bytes * slots)
-                ):
-                    raise ManifestError(
-                        f"DSv4.1 Index-K cache {layer_name} pages must cover whole "
-                        f"{slots}-record owner rows: rows={rows}, "
-                        f"offset={offset_bytes}, stride={stride_bytes}"
-                    )
-                unit_rows, unit_bytes = rows // slots, row_bytes * slots
             pools.append(
                 PoolEntry(
                     tag=dsv4_group_tag(tag_base, group_index),

@@ -385,3 +385,49 @@ def test_index_k_pages_travel_as_whole_halfplane_owner_rows():
     # row 1 holds record 2 in its low halfplanes.
     base = pool.base_offset_bytes + pool.block_stride_bytes
     assert _live_byte_ranges(pool, 1, 6, 256) == [(base, base + 2 * 512)]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "rows,stride,expected_page_rows",
+    [(64, 16384, 17), (128, 32768, 33)],
+)
+def test_packed_fp8_index_k_pages_travel_as_whole_transposed_pages(
+    rows, stride, expected_page_rows
+):
+    """Packed FP8 Index-K (#2573) writes every column across all 33 fields
+    (word = field * rows + col, 4 bytes/word, rounded up to whole 512-byte
+    owner rows). Both full pages and partial tail pages must ship the entire
+    `page_rows * 512` byte block so field-32 FP32 scales and all 32 feature
+    groups arrive intact."""
+    named, groups, raw, materialized = _materialization()
+    page_tokens = rows * 2
+    materialized.native_cache_layouts[IDX] = (
+        (NUM_BLOCKS, rows, 132),
+        torch.uint8,
+        stride,
+        0,
+    )
+    groups[3] = _group(IDX, _spec(page_tokens, tokens_per_state=2))
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=raw,
+        dsv41_materialized_kv=materialized,
+    )
+    pool = _pool(manifest, "dsv4.idx.r2.g3")
+    (region,) = pool.regions
+    expected_live_bytes = expected_page_rows * 512
+    assert (region.unit_bytes, region.num_units) == (expected_live_bytes, 1)
+    assert pool.live_bytes_per_block == expected_live_bytes
+
+    for num_tokens in (1, 5, page_tokens):
+        block = 1
+        ranges = _live_byte_ranges(pool, block, num_tokens, page_tokens)
+        base = pool.base_offset_bytes + block * pool.block_stride_bytes
+        assert ranges == [(base, base + expected_live_bytes)]
+        live_cols = (num_tokens + 1) // 2
+        for col in range(live_cols):
+            for field in range(33):
+                word_byte = base + (field * rows + col) * 4
+                assert _covered(ranges, word_byte, 4), (num_tokens, col, field)

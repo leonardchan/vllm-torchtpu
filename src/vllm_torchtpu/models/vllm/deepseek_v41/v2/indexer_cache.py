@@ -20,13 +20,24 @@ from .cache import IndexCacheRows, NativeCacheView, PagedCacheRows, RawCachePool
 logger = init_logger(__name__)
 
 
-def indexer_uses_fp8(config: VllmConfig) -> bool:
-    default_dtype = (
-        "bf16" if getattr(config, "kv_transfer_config", None) is not None else "fp8"
+def _uses_unsupported_kv_transfer(config: VllmConfig) -> bool:
+    kv_transfer = getattr(config, "kv_transfer_config", None)
+    return (
+        kv_transfer is not None
+        and getattr(kv_transfer, "kv_connector", None) != "TPURaidenConnector"
     )
-    dtype = config.attention_config.resolve_indexer_kv_dtype(default_dtype)
+
+
+def indexer_uses_fp8(config: VllmConfig) -> bool:
+    default_dtype = "bf16" if _uses_unsupported_kv_transfer(config) else "fp8"
+    attention_config = getattr(config, "attention_config", None)
+    dtype = (
+        attention_config.resolve_indexer_kv_dtype(default_dtype)
+        if attention_config is not None
+        else default_dtype
+    )
     if dtype not in ("bf16", "fp8"):
-        raise ValueError(f"TPU V4.1 indexer requires bf16 or fp8, got {dtype}")
+        raise ValueError(f"TPU V4.1 indexer requires bf16 or fp8, got {dtype!r}")
     return dtype == "fp8"
 
 
@@ -132,16 +143,15 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
 
     def __init__(self, *args, **kwargs):
         config = get_current_vllm_config()
-        # Stage-3 transfer moves halfplane (bf16) Index-K pages as whole owner
-        # rows (see the DSv4.1 Index-K pools in raiden/pool_manifest.py).
+        # Stage-3 TPURaidenConnector moves both halfplane (bf16) and packed_fp8
+        # Index-K pages via native owner-row regions in raiden/pool_manifest.py.
         if getattr(config.cache_config, "kv_offloading_size", 0):
-            raise ValueError("Halfplane Index-K does not support external KV offload")
-        self.packed_fp8 = indexer_uses_fp8(config)
-        if self.packed_fp8 and getattr(config, "kv_transfer_config", None) is not None:
+            raise ValueError("TPU V4.1 Index-K does not support external KV offload")
+        if _uses_unsupported_kv_transfer(config):
             raise ValueError(
-                "Packed FP8 Index-K does not support external KV transfer; "
-                "use indexer_kv_dtype='bf16'"
+                "TPU V4.1 Index-K does not support non-Raiden external KV transfer"
             )
+        self.packed_fp8 = indexer_uses_fp8(config)
         head_dim = config.model_config.hf_config.index_head_dim
         if self.packed_fp8 and head_dim != 128:
             raise ValueError("Packed FP8 indexer requires index_head_dim=128")
